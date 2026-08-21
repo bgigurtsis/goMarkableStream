@@ -15,6 +15,7 @@ const FRAME_TYPE_FULL = 0x00;  // Deprecated: uncompressed full frame
 const FRAME_TYPE_DELTA = 0x01;
 const FRAME_TYPE_FULL_COMPRESSED = 0x02;  // Gzip-compressed full frame (legacy)
 const FRAME_TYPE_FULL_ZSTD = 0x03;  // Zstd-compressed full frame
+const FRAME_TYPE_DELTA_ZSTD = 0x04;  // Zstd-compressed delta frame
 
 // Import fzstd for zstd decompression (vendored locally for offline use)
 importScripts('/lib/fzstd.min.js');
@@ -177,6 +178,15 @@ async function processDeltaData(chunkData, imageData, pixelDataSize) {
 			await handleFullFrame(payload, imageData, pixelDataSize, 'zstd');
 		} else if (frameType === FRAME_TYPE_DELTA) {
 			handleDeltaFrame(payload, imageData, pixelDataSize);
+		} else if (frameType === FRAME_TYPE_DELTA_ZSTD) {
+			let runs;
+			try {
+				runs = fzstd.decompress(payload);
+			} catch (err) {
+				console.error('Zstd delta decompression failed:', err);
+				continue;
+			}
+			handleDeltaFrame(runs, imageData, pixelDataSize);
 		}
 	}
 }

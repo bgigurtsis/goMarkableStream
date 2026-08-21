@@ -50,6 +50,13 @@ void main(void) {
 }
 `;
 
+// Framebuffer channel order.
+// RM2 firmware 3.24+ and the Paper Pro deliver BGRA, but WebGL1 has no BGRA
+// texture format. Rather than swizzling 10MB per frame on the CPU, we upload
+// the bytes as-is and swap the red and blue channels in the shader, which is
+// free on the GPU.
+const texSwizzle = useBGRA ? '.bgra' : '';
+
 // Fragment shader program
 const fsSource = `
 precision highp float;
@@ -69,7 +76,7 @@ const float LASER_EDGE_SOFTNESS = 2.0;
 const vec3 LASER_COLOR = vec3(1.0, 0.0, 0.0);
 
 void main(void) {
-    vec4 texColor = texture2D(uSampler, vTextureCoord);
+    vec4 texColor = texture2D(uSampler, vTextureCoord)${texSwizzle};
     vec4 finalColor = texColor;
 
     // Render trail points (oldest to newest, back to front)
@@ -323,10 +330,7 @@ drawScene(gl, programInfo, positionBuffer, textureCoordBuffer, texture);
 
 // Update texture
 function updateTexture(newRawData, shouldRotate, scaleFactor) {
-	if (useBGRA) {
-        convertBGRAtoRGBA(newRawData);
-    };
-
+	// No CPU-side channel swap: BGRA is handled by the fragment shader swizzle.
 	gl.bindTexture(gl.TEXTURE_2D, texture);
 	gl.texSubImage2D(gl.TEXTURE_2D, 0, 0, 0, screenWidth, screenHeight, gl.RGBA, gl.UNSIGNED_BYTE, newRawData);
 
@@ -340,14 +344,6 @@ function updateTexture(newRawData, shouldRotate, scaleFactor) {
 	gl.uniform1f(uScaleFactorLocation, scaleFactor);
 
 	drawScene(gl, programInfo, positionBuffer, textureCoordBuffer, texture);
-}
-
-function convertBGRAtoRGBA(data) {
-    for (let i = 0; i < data.length; i += 4) {
-        const b = data[i];     // Blue
-        data[i] = data[i + 2]; // Swap Red and Blue
-        data[i + 2] = b;
-    }
 }
 
 // Redraw scene with current texture (for rotation changes without new frame data)

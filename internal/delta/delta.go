@@ -15,23 +15,46 @@ import (
 	"github.com/owulveryck/goMarkableStream/internal/trace"
 )
 
-// zstdEncoderPool reuses zstd encoders to avoid allocation overhead
-var zstdEncoderPool = sync.Pool{
-	New: func() any {
-		enc, _ := zstd.NewWriter(nil, zstd.WithEncoderLevel(zstd.SpeedFastest))
-		return enc
-	},
+// newFullFrameEncoder builds an encoder for whole-framebuffer compression.
+//
+// Concurrency is pinned to 1 on purpose: by default zstd fans out to GOMAXPROCS
+// goroutines and allocates per-goroutine state, which costs ~20MB of retained
+// buffers per encoder. On a dual-core device that fan-out also steals the core
+// the framebuffer reader needs, so it buys nothing.
+func newFullFrameEncoder() *zstd.Encoder {
+	enc, _ := zstd.NewWriter(nil,
+		zstd.WithEncoderLevel(zstd.SpeedFastest),
+		zstd.WithEncoderConcurrency(1),
+	)
+	return enc
 }
 
-// ResetEncoderPool replaces the zstd encoder pool with a fresh one,
+// newDeltaEncoder builds an encoder for delta run streams. Delta payloads are
+// small and highly local (long repeats of untouched background), so a bounded
+// window keeps nearly all of the compression ratio while shrinking the retained
+// encoder state by roughly 4x compared to the full-frame encoder.
+func newDeltaEncoder() *zstd.Encoder {
+	enc, _ := zstd.NewWriter(nil,
+		zstd.WithEncoderLevel(zstd.SpeedFastest),
+		zstd.WithEncoderConcurrency(1),
+		zstd.WithWindowSize(deltaWindowSize),
+	)
+	return enc
+}
+
+// zstdEncoderPool reuses zstd encoders to avoid allocation overhead.
+// Full frames and deltas use separate pools so that an encoder sized for a 10MB
+// framebuffer is never recycled for a few-KB delta.
+var (
+	zstdEncoderPool      = sync.Pool{New: func() any { return newFullFrameEncoder() }}
+	zstdDeltaEncoderPool = sync.Pool{New: func() any { return newDeltaEncoder() }}
+)
+
+// ResetEncoderPool replaces the zstd encoder pools with fresh ones,
 // allowing old encoders to be garbage collected.
 func ResetEncoderPool() {
-	zstdEncoderPool = sync.Pool{
-		New: func() any {
-			enc, _ := zstd.NewWriter(nil, zstd.WithEncoderLevel(zstd.SpeedFastest))
-			return enc
-		},
-	}
+	zstdEncoderPool = sync.Pool{New: func() any { return newFullFrameEncoder() }}
+	zstdDeltaEncoderPool = sync.Pool{New: func() any { return newDeltaEncoder() }}
 }
 
 const (
@@ -40,9 +63,26 @@ const (
 	FrameTypeDelta          = 0x01
 	FrameTypeFullCompressed = 0x02 // Gzip-compressed full frame (legacy)
 	FrameTypeFullZstd       = 0x03 // Zstd-compressed full frame
+	FrameTypeDeltaZstd      = 0x04 // Zstd-compressed delta frame
 
 	// DefaultThreshold is the default change ratio above which a full frame is sent
 	DefaultThreshold = 0.30
+
+	// minDeltaCompressSize is the delta payload size below which compression is
+	// skipped: zstd framing overhead plus CPU cost outweighs the saving, and such
+	// frames are negligible on the wire anyway.
+	minDeltaCompressSize = 1024
+
+	// Falling back to a full frame means pushing the whole framebuffer through
+	// zstd (~10MB, i.e. ~10x the CPU of a typical delta on a Cortex-A9), so it is
+	// only worth it when the saving is substantial in both relative and absolute
+	// terms. A delta must be at least fullFrameAdvantage times bigger than the
+	// last full frame *and* above minFullSwitchSize on the wire before we switch.
+	fullFrameAdvantage = 2
+	minFullSwitchSize  = 32 * 1024
+
+	// deltaWindowSize bounds the zstd match window used for delta payloads.
+	deltaWindowSize = 256 * 1024
 
 	// Maximum values for short run encoding
 	maxShortOffset = 0xFFFF // 64KB - 1
@@ -71,7 +111,14 @@ type Encoder struct {
 	compressedBuf []byte      // Reusable buffer for ZSTD compression output
 	maskBuf       []byte      // Reusable buffer for block comparison mask
 	writeBuf      []byte      // Reusable buffer for coalesced delta frame writes
+	deltaZstdBuf  []byte      // Reusable buffer for ZSTD-compressed delta frames
 	prevChecksum  [16]byte    // XOR-fold checksum of previous frame (ARM32 idle detection)
+
+	// lastFullSize is the total wire size (header included) of the most recent
+	// full frame sent. It is the reference used to decide whether a delta is
+	// actually cheaper than resending the whole screen, without having to
+	// compress 10MB on every frame just to answer the question.
+	lastFullSize int
 }
 
 // NewEncoder creates a new delta encoder with the given threshold.
@@ -148,19 +195,38 @@ func (e *Encoder) EncodeWithSize(current []byte, w io.Writer) (n int, err error)
 	// Calculate change ratio
 	changeRatio := float64(changedBytes) / float64(frameSize)
 
-	// Calculate delta payload size
-	deltaSize := e.calculateDeltaSize(runs)
-
-	// If change ratio exceeds threshold OR delta is larger than full frame, send full frame
-	// prevFrame was already updated during compareAndCopyFrames
-	if changeRatio > e.threshold || deltaSize >= frameSize {
+	// Cheap guard before doing any work: a delta covering more than `threshold`
+	// of the screen is expensive to assemble and compress, and is very unlikely
+	// to beat a compressed full frame.
+	// prevFrame was already updated during compareAndCopyFrames.
+	if changeRatio > e.threshold {
 		debug.Log("Delta: changeRatio=%.2f%%, runs=%d, sending full", changeRatio*100, len(runs))
 		return e.writeFullFrame(current, w)
 	}
 
-	// Send delta frame - prevFrame already updated during compareAndCopyFrames
-	debug.Log("Delta: changeRatio=%.2f%%, runs=%d, sending delta", changeRatio*100, len(runs))
-	return e.writeDeltaFrame(runs, deltaSize, w)
+	// Assemble the delta frame, then compress the run stream. Delta payloads are
+	// BGRA stroke data (long runs of identical background) and compress by
+	// roughly 25x on real content, so this dominates the bandwidth budget.
+	deltaSize := e.calculateDeltaSize(runs)
+	frame := e.assembleDeltaFrame(runs, deltaSize)
+	if compressed := e.compressDeltaFrame(frame[4:]); compressed != nil {
+		frame = compressed
+	}
+
+	// Now that the true wire size is known, compare it against the alternative:
+	// resending the whole screen zstd-compressed. Comparing against the
+	// *uncompressed* frame size (as a naive check would) is meaningless — a full
+	// frame compresses ~33x, so a large raw delta can easily be several times
+	// bigger than simply starting over.
+	if e.lastFullSize > 0 && len(frame) > minFullSwitchSize && len(frame) >= fullFrameAdvantage*e.lastFullSize {
+		debug.Log("Delta: changeRatio=%.2f%%, delta=%d >= full=%d, sending full",
+			changeRatio*100, len(frame), e.lastFullSize)
+		return e.writeFullFrame(current, w)
+	}
+
+	debug.Log("Delta: changeRatio=%.2f%%, runs=%d, sending delta (%d bytes)",
+		changeRatio*100, len(runs), len(frame))
+	return w.Write(frame)
 }
 
 // compareAndCopyFrames compares current frame with previous, copies current → prev
@@ -524,6 +590,10 @@ func (e *Encoder) writeFullFrame(data []byte, w io.Writer) (int, error) {
 	e.frameHeader[2] = byte((payloadLen >> 8) & 0xFF)
 	e.frameHeader[3] = byte((payloadLen >> 16) & 0xFF)
 
+	// Record the wire cost of resending the whole screen, so subsequent frames
+	// can tell whether a delta is actually the cheaper option.
+	e.lastFullSize = 4 + payloadLen
+
 	if _, err := w.Write(e.frameHeader[:]); err != nil {
 		return 0, err
 	}
@@ -534,11 +604,56 @@ func (e *Encoder) writeFullFrame(data []byte, w io.Writer) (int, error) {
 	return 4 + n, nil
 }
 
-// writeDeltaFrame assembles the entire delta frame (header + all runs) into
-// a single buffer and writes it with one w.Write() call. This eliminates
-// per-run write overhead (2N+1 calls → 1 call) which reduces syscall and
-// interface dispatch costs, especially on ARM32.
+// writeDeltaFrame assembles an uncompressed delta frame and writes it with a
+// single w.Write() call. Used for the empty-delta keepalive.
 func (e *Encoder) writeDeltaFrame(runs []changeRun, payloadSize int, w io.Writer) (int, error) {
+	return w.Write(e.assembleDeltaFrame(runs, payloadSize))
+}
+
+// compressDeltaFrame zstd-compresses a delta run stream and returns a complete
+// frame (4-byte FrameTypeDeltaZstd header + compressed payload), or nil when
+// compression is not worth it and the caller should send the payload as-is.
+func (e *Encoder) compressDeltaFrame(payload []byte) []byte {
+	if len(payload) < minDeltaCompressSize {
+		return nil
+	}
+
+	span := trace.BeginSpan("zstd_compress_delta")
+
+	enc := zstdDeltaEncoderPool.Get().(*zstd.Encoder)
+	defer func() {
+		enc.Reset(nil) // Clear internal buffers before returning to pool
+		zstdDeltaEncoderPool.Put(enc)
+	}()
+
+	// Reserve the 4 header bytes up front so EncodeAll appends straight after
+	// them: the frame is emitted with a single Write and no extra copy.
+	e.deltaZstdBuf = append(e.deltaZstdBuf[:0], 0, 0, 0, 0)
+	e.deltaZstdBuf = enc.EncodeAll(payload, e.deltaZstdBuf)
+
+	compressedLen := len(e.deltaZstdBuf) - 4
+	trace.EndSpan(span, map[string]any{
+		"input_size":  len(payload),
+		"output_size": compressedLen,
+	})
+
+	// Incompressible payload: sending it raw avoids the client-side inflate.
+	if compressedLen >= len(payload) {
+		return nil
+	}
+
+	e.deltaZstdBuf[0] = FrameTypeDeltaZstd
+	e.deltaZstdBuf[1] = byte(compressedLen & 0xFF)
+	e.deltaZstdBuf[2] = byte((compressedLen >> 8) & 0xFF)
+	e.deltaZstdBuf[3] = byte((compressedLen >> 16) & 0xFF)
+	return e.deltaZstdBuf
+}
+
+// assembleDeltaFrame builds the entire delta frame (4-byte header + all runs)
+// into a single reusable buffer. This eliminates per-run write overhead
+// (2N+1 calls → 1 call) which reduces syscall and interface dispatch costs,
+// especially on ARM32. The returned slice is valid until the next call.
+func (e *Encoder) assembleDeltaFrame(runs []changeRun, payloadSize int) []byte {
 	totalSize := 4 + payloadSize
 
 	// Reuse write buffer, grow if needed
@@ -573,7 +688,7 @@ func (e *Encoder) writeDeltaFrame(runs []changeRun, payloadSize int, w io.Writer
 		pos += len(run.data)
 	}
 
-	return w.Write(buf[:pos])
+	return buf[:pos]
 }
 
 // Reset clears the encoder state, forcing the next frame to be a full frame.
@@ -592,4 +707,6 @@ func (e *Encoder) ReleaseMemory() {
 	e.compressedBuf = nil
 	e.maskBuf = nil
 	e.writeBuf = nil
+	e.deltaZstdBuf = nil
+	e.lastFullSize = 0
 }

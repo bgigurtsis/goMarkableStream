@@ -60,24 +60,29 @@ type StreamHandler struct {
 	file           io.ReaderAt
 	pointerAddr    int64
 	inputEventsBus *pubsub.PubSub
-	deltaEncoder   *delta.Encoder
-	flusher        http.Flusher // Cached flusher interface per connection
+
+	// session guards deltaEncoder, which is per-connection state: the previous
+	// frame it diffs against and its scratch buffers. ThrottlingMiddleware
+	// admits one streamer at a time, but net/http may call any http.Handler
+	// concurrently, so the handler has to hold on its own.
+	session      sync.Mutex
+	deltaEncoder *delta.Encoder
 }
 
 // ReleaseMemory releases large buffers held by the stream handler's delta encoder.
 func (h *StreamHandler) ReleaseMemory() {
+	// A live stream owns those buffers; freeing them mid-session would only
+	// force an immediate reallocation, so skipping is the right answer.
+	if !h.session.TryLock() {
+		return
+	}
+	defer h.session.Unlock()
 	h.deltaEncoder.ReleaseMemory()
 }
 
 // ServeHTTP implements http.Handler
 func (h *StreamHandler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	debug.Log("Stream: new connection from %s", r.RemoteAddr)
-
-	// Cache flusher interface for this connection
-	h.flusher, _ = w.(http.Flusher)
-
-	// Reset delta encoder to force a full frame for the new client
-	h.deltaEncoder.Reset()
 
 	// Parse query parameters - each client gets its own rate
 	rate := defaultRate
@@ -111,6 +116,18 @@ func (h *StreamHandler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
+	// Claim the encoder for this connection. Taken after the preflight branch so
+	// a CORS check never gets turned away by an in-flight stream.
+	if !h.session.TryLock() {
+		debug.Log("Stream: rejecting %s, another connection owns the encoder", r.RemoteAddr)
+		http.Error(w, "Too Many Requests", http.StatusTooManyRequests)
+		return
+	}
+	defer h.session.Unlock()
+
+	// Reset delta encoder to force a full frame for the new client
+	h.deltaEncoder.Reset()
+
 	// Subscribe only to EvAbs events (pen position and pressure)
 	// This filters out unnecessary EvSyn, EvKey, etc.
 	absType := uint16(events.EvAbs)
@@ -129,6 +146,7 @@ func (h *StreamHandler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	asyncCtx, asyncCancel := context.WithCancel(r.Context())
 	defer asyncCancel()
 	asyncReader := NewAsyncFrameReader(h.file, h.pointerAddr, remarkable.Config.SizeBytes)
+	asyncReader.SetInterval(rate * time.Millisecond)
 	go asyncReader.Run(asyncCtx)
 
 	writing := true
@@ -211,11 +229,13 @@ func (h *StreamHandler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 			cooldownActive = false
 		case <-ticker.C:
 			if writing {
+				next := rate * time.Millisecond
 				if frameSize := h.fetchAndSendDeltaAsync(w, asyncReader); frameSize > 0 {
-					ticker.Reset(adaptRate(frameSize, rate*time.Millisecond))
-				} else {
-					ticker.Reset(rate * time.Millisecond)
+					next = adaptRate(frameSize, rate*time.Millisecond)
 				}
+				ticker.Reset(next)
+				// Keep the background reader paced to whatever rate we settled on.
+				asyncReader.SetInterval(next)
 			}
 		}
 	}
@@ -242,10 +262,17 @@ func (h *StreamHandler) fetchAndSendDelta(w io.Writer, rawData []uint8) int {
 		return 0
 	}
 	debug.Log("Stream: sent frame (%d bytes)", frameSize)
-	if h.flusher != nil {
-		h.flusher.Flush()
-	}
+	flush(w)
 	return frameSize
+}
+
+// flush pushes the frame out if the writer buffers. Asserting per frame costs a
+// few nanoseconds next to encoding a 10 MB framebuffer, and keeps the flusher
+// out of StreamHandler, where it was shared state across connections.
+func flush(w io.Writer) {
+	if f, ok := w.(http.Flusher); ok {
+		f.Flush()
+	}
 }
 
 // adaptRate adjusts the frame ticker interval based on the last encoded frame size.
@@ -291,8 +318,6 @@ func (h *StreamHandler) fetchAndSendDeltaAsync(w io.Writer, reader *AsyncFrameRe
 		return 0
 	}
 	debug.Log("Stream: sent frame (%d bytes)", frameSize)
-	if h.flusher != nil {
-		h.flusher.Flush()
-	}
+	flush(w)
 	return frameSize
 }
