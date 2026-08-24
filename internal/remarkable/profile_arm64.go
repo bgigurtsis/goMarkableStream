@@ -10,9 +10,8 @@ import (
 )
 
 const (
-	paperPureWidth        = 1404
-	paperPureHeight       = 1872
-	paperPureStridePixels = 1408
+	paperPureWidth  = 1404
+	paperPureHeight = 1872
 )
 
 func init() {
@@ -41,17 +40,17 @@ func applyArm64DeviceProfile(model DeviceModel) {
 	}
 	ScreenWidth = paperPureWidth
 	ScreenHeight = paperPureHeight
-	ScreenSizeBytes = paperPureStridePixels * paperPureHeight * BytesPerPixelGray16
+	ScreenSizeBytes = paperPureWidth * paperPureHeight * BytesPerPixelBGRA
 	Config = FramebufferConfig{
 		Width:          paperPureWidth,
 		Height:         paperPureHeight,
-		StridePixels:   paperPureStridePixels,
-		BytesPerPixel:  BytesPerPixelGray16,
+		StridePixels:   paperPureWidth,
+		BytesPerPixel:  BytesPerPixelBGRA,
 		SizeBytes:      ScreenSizeBytes,
-		UseBGRA:        false,
+		UseBGRA:        true,
 		TextureFlipped: false,
 	}
-	log.Printf("Detected reMarkable Paper Pure profile (%dx%d RGB565)", paperPureWidth, paperPureHeight)
+	log.Printf("Detected reMarkable Paper Pure profile (%dx%d BGRA)", paperPureWidth, paperPureHeight)
 }
 
 func detectInputDevices(root, defaultPen, defaultTouch string) (string, string) {
@@ -64,7 +63,7 @@ func detectInputDevices(root, defaultPen, defaultTouch string) (string, string) 
 		}
 		name := strings.ToLower(string(nameBytes))
 		device := filepath.Join("/dev/input", filepath.Base(event))
-		if strings.Contains(name, "pen") || strings.Contains(name, "stylus") || strings.Contains(name, "wacom") {
+		if strings.Contains(name, "pen") || strings.Contains(name, "stylus") || strings.Contains(name, "wacom") || strings.Contains(name, "marker") {
 			pen = device
 		}
 		if strings.Contains(name, "touch") || strings.Contains(name, "goodix") {

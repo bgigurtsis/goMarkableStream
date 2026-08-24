@@ -22,6 +22,14 @@ import (
 // Both devices now use BGRA format, but the underlying hardware architecture
 // necessitates different pointer detection methods.
 func getFramePointer(pid string) (int64, error) {
+	if Model == RemarkablePaperPure {
+		framePointer, err := getFramebufferSpyPointer()
+		if err != nil {
+			return 0, fmt.Errorf("failed to get Paper Pure framebuffer from Xovi framebuffer-spy: %w", err)
+		}
+		return framePointer, nil
+	}
+
 	// Find the memory range for the framebuffer
 	startAddress, err := getMemoryRange(pid)
 	if err != nil {

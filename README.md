@@ -29,14 +29,16 @@ Its primary goal is to enable users to stream their reMarkable tablet screen to 
 
 **Actively supported and tested:**
 - reMarkable 2 with firmware 3.24+
+- reMarkable Paper Pure with firmware 3.27.3.0
 
 **Experimental (not actively tested):**
 - reMarkable Paper Pro - initial support, some features may not work as expected
-- reMarkable Paper Pure - runtime profile for `imx93-tatsu`, pending physical-device validation
 
 The Paper Pure profile detects its model and input devices at runtime. It reads
-the 1404 x 1872 RGB565 framebuffer with its 1408-pixel memory stride. The
-`/screenshot` endpoint returns a portrait PNG for clients such as Klaus.
+the 1404 x 1872 BGRA framebuffer through Xovi framebuffer-spy. The
+`/screenshot` endpoint returns a portrait PNG for clients such as Klaus. Install
+the Vellum `framebuffer-spy` and `xovi-message-broker` packages before starting
+the streamer.
 
 ## Version Support
 
