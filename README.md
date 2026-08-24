@@ -32,6 +32,11 @@ Its primary goal is to enable users to stream their reMarkable tablet screen to 
 
 **Experimental (not actively tested):**
 - reMarkable Paper Pro - initial support, some features may not work as expected
+- reMarkable Paper Pure - runtime profile for `imx93-tatsu`, pending physical-device validation
+
+The Paper Pure profile detects its model and input devices at runtime. It reads
+the 1404 x 1872 RGB565 framebuffer with its 1408-pixel memory stride. The
+`/screenshot` endpoint returns a portrait PNG for clients such as Klaus.
 
 ## Version Support
 
@@ -371,4 +376,3 @@ If you have any ideas, bug reports, or feature requests, please submit them thro
 
 The reMarkable Screen Streaming Tool is released under the [MIT License](https://opensource.org/licenses/MIT) .
 Feel free to modify, distribute, and use the tool in accordance with the terms of the license.
-

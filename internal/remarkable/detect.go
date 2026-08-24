@@ -97,6 +97,7 @@ func initConfigForFirmware() {
 		Config = FramebufferConfig{
 			Width:          newFormatWidth,
 			Height:         newFormatHeight,
+			StridePixels:   newFormatWidth,
 			BytesPerPixel:  BytesPerPixelBGRA,
 			SizeBytes:      newFormatWidth * newFormatHeight * BytesPerPixelBGRA,
 			PointerOffset:  newFormatPointerOffset,
@@ -108,6 +109,7 @@ func initConfigForFirmware() {
 		Config = FramebufferConfig{
 			Width:          ScreenWidth,
 			Height:         ScreenHeight,
+			StridePixels:   ScreenWidth,
 			BytesPerPixel:  BytesPerPixelGray16,
 			SizeBytes:      ScreenWidth * ScreenHeight * BytesPerPixelGray16,
 			PointerOffset:  0,

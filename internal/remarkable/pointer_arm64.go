@@ -103,7 +103,7 @@ func calculateFramePointer(pid string, startAddress int64) (int64, error) {
 	// The memory header contains a length field (4 bytes) which we use to determine
 	// how much memory to skip. We dynamically calculate the offset until the
 	// buffer size (width x height x 4 bytes per pixel) is reached.
-	for length < ScreenSizeBytes {
+	for length < Config.SizeBytes {
 		offset += int64(length - 2)
 
 		// Seek to the start address plus offset and read the header
