@@ -14,7 +14,7 @@ import (
 //
 // RMPP uses a modern GPU/DRM display stack (/dev/dri/card0) rather than
 // the classic framebuffer device. This requires a more complex algorithm:
-// 1. Find the last /dev/dri/card0 mapping in /proc/[pid]/maps
+// 1. Find the last /dev/dri/card* mapping in /proc/[pid]/maps
 // 2. Read memory headers to dynamically calculate the buffer offset
 // 3. Iterate until the correct buffer size is found
 //
@@ -37,7 +37,7 @@ func getFramePointer(pid string) (int64, error) {
 	return framePointer, nil
 }
 
-// getMemoryRange retrieves the end address of the last /dev/dri/card0 entry from /proc/[pid]/maps
+// getMemoryRange retrieves the end address of the last DRM card entry from /proc/[pid]/maps.
 func getMemoryRange(pid string) (int64, error) {
 	mapsFilePath := fmt.Sprintf("/proc/%s/maps", pid)
 	file, err := os.Open(mapsFilePath)
@@ -49,13 +49,13 @@ func getMemoryRange(pid string) (int64, error) {
 	var memoryRange string
 	scanner := bufio.NewScanner(file)
 
-	// Find the last occurrence of /dev/dri/card0
+	// Find the last DRM card mapping. Paper Pure and Paper Pro can use different card numbers.
 	// We need the memory mapping for the display, which is located immediately
 	// after the last /dev/dri/card0 mapping. Hence, we keep iterating through
 	// the file and update memoryRange each time we encounter /dev/dri/card0.
 	for scanner.Scan() {
 		line := scanner.Text()
-		if strings.Contains(line, "/dev/dri/card0") {
+		if strings.Contains(line, "/dev/dri/card") {
 			memoryRange = line
 		}
 	}
@@ -65,7 +65,7 @@ func getMemoryRange(pid string) (int64, error) {
 	}
 
 	if memoryRange == "" {
-		return 0, fmt.Errorf("no mapping found for /dev/dri/card0")
+		return 0, fmt.Errorf("no mapping found for a DRM card")
 	}
 
 	// Extract the end address of the last /dev/dri/card0 memory range
@@ -98,12 +98,17 @@ func calculateFramePointer(pid string, startAddress int64) (int64, error) {
 
 	var offset int64
 	length := 2
+	iterations := 0
 
 	// Iterate to calculate the correct offset within the frame buffer memory
 	// The memory header contains a length field (4 bytes) which we use to determine
 	// how much memory to skip. We dynamically calculate the offset until the
 	// buffer size (width x height x 4 bytes per pixel) is reached.
 	for length < Config.SizeBytes {
+		iterations++
+		if iterations > 4096 {
+			return 0, fmt.Errorf("framebuffer header scan exceeded its limit")
+		}
 		offset += int64(length - 2)
 
 		// Seek to the start address plus offset and read the header
@@ -119,6 +124,9 @@ func calculateFramePointer(pid string, startAddress int64) (int64, error) {
 
 		// Extract the length from the header (4 bytes at the beginning of the header)
 		length = int(int64(header[0]) | int64(header[1])<<8 | int64(header[2])<<16 | int64(header[3])<<24)
+		if length < 2 {
+			return 0, fmt.Errorf("invalid framebuffer block length %d", length)
+		}
 	}
 
 	// Return the calculated frame pointer address
