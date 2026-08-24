@@ -1,6 +1,7 @@
 package stream
 
 import (
+	"fmt"
 	"image"
 	"image/png"
 	"io"
@@ -75,6 +76,7 @@ func (h *ScreenshotHandler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	w.Header().Set("Content-Type", "image/png")
 	w.Header().Set("Content-Disposition", "attachment; filename=\""+filename+"\"")
 	w.Header().Set("Cache-Control", "no-cache")
+	w.Header().Set("X-Remarkable-Orientation", fmt.Sprintf("%d", remarkable.CurrentOrientation()))
 
 	if err := png.Encode(w, img); err != nil {
 		log.Printf("failed to encode PNG: %v", err)
