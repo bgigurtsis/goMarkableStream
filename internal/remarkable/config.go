@@ -15,6 +15,7 @@ const (
 type FramebufferConfig struct {
 	Width          int
 	Height         int
+	StridePixels   int
 	BytesPerPixel  int
 	SizeBytes      int
 	PointerOffset  int64
@@ -31,6 +32,7 @@ func init() {
 	Config = FramebufferConfig{
 		Width:          ScreenWidth,
 		Height:         ScreenHeight,
+		StridePixels:   ScreenWidth,
 		BytesPerPixel:  ScreenSizeBytes / (ScreenWidth * ScreenHeight),
 		SizeBytes:      ScreenSizeBytes,
 		PointerOffset:  0,
